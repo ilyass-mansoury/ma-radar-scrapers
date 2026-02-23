@@ -1,6 +1,6 @@
 """
-M&A Radar Maroc — Point d'entrée principal
-Lance le pipeline complet : collecte → scoring IA → sauvegarde Supabase
+M&A Radar Maroc — Pipeline Principal
+Sources : OMPIC + Presse + Bulletin Officiel + Conseil de la Concurrence
 """
 
 import sys
@@ -10,35 +10,31 @@ import time
 from datetime import datetime
 from loguru import logger
 
-from scrapers.ompic   import OmpicScraper
-from scrapers.presse  import PresseEcoScraper
-from scoring.engine   import ScoringEngine
-from config           import SEUIL_CRITIQUE, SEUIL_VIGILANCE, HEURE_SCAN_QUOTIDIEN
-
-# Supabase
+from scrapers.ompic                import OmpicScraper
+from scrapers.presse               import PresseEcoScraper
+from scrapers.bulletin_officiel    import BulletinOfficielScraper
+from scrapers.conseil_concurrence  import ConseilConcurrenceScraper
+from scoring.engine                import ScoringEngine
+from config                        import HEURE_SCAN_QUOTIDIEN
 from supabase import create_client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ─── LOGS ────────────────────────────────────────────────────────────────────
 logger.remove()
 logger.add(sys.stdout, format="<green>{time:HH:mm:ss}</green> | {message}", level="INFO")
 
 
 def get_supabase():
-    """Retourne le client Supabase."""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("⚠️ Variables Supabase manquantes — mode local uniquement")
+        logger.warning("⚠️ Variables Supabase manquantes")
         return None
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def sauvegarder_opportunite(supabase, signal: dict):
-    """Sauvegarde une opportunité dans Supabase."""
+def sauvegarder_opportunite(supabase, signal):
     if not supabase:
         return
-
     try:
         data = {
             "entreprise":       signal.get("entreprise") or signal.get("titre", "N/A")[:50],
@@ -52,19 +48,15 @@ def sauvegarder_opportunite(supabase, signal: dict):
             "memo_origination": signal.get("memo_origination", ""),
             "statut":           "nouveau",
         }
-
         supabase.table("opportunites").upsert(data, on_conflict="entreprise").execute()
-        logger.success(f"   💾 Sauvegardé → {data['entreprise']} (score {data['score_final']})")
-
+        logger.success(f"   💾 {data['entreprise']} → score {data['score_final']} ({data['niveau_alerte']})")
     except Exception as e:
-        logger.error(f"   ❌ Erreur Supabase : {e}")
+        logger.error(f"   ❌ Supabase : {e}")
 
 
-def sauvegarder_signal(supabase, signal: dict):
-    """Sauvegarde un signal brut dans Supabase."""
+def sauvegarder_signal(supabase, signal):
     if not supabase:
         return
-
     try:
         data = {
             "source":      signal.get("source", "N/A"),
@@ -75,113 +67,93 @@ def sauvegarder_signal(supabase, signal: dict):
             "url":         signal.get("url", ""),
             "raw_text":    signal.get("raw_text", "")[:500],
         }
-
         supabase.table("signaux").insert(data).execute()
-
     except Exception as e:
-        logger.error(f"   ❌ Erreur signal Supabase : {e}")
+        logger.debug(f"Signal save error: {e}")
 
 
 def run_pipeline():
-    """Pipeline complet du M&A Radar Maroc."""
-
-    debut = datetime.now()
+    debut    = datetime.now()
     supabase = get_supabase()
 
     logger.info("=" * 60)
     logger.info(f"🚀 M&A RADAR MAROC — Scan du {debut.strftime('%d/%m/%Y à %H:%M')}")
     logger.info("=" * 60)
 
-    # ── COLLECTE ──────────────────────────────────────────────────────────────
-    logger.info("\n📡 PHASE 1 — Collecte des signaux\n")
-
+    logger.info("\n📡 PHASE 1 — Collecte (4 sources)\n")
     tous_signaux = []
 
-    try:
-        ompic = OmpicScraper()
-        signaux_ompic = ompic.run()
-        tous_signaux.extend(signaux_ompic)
-        logger.info(f"   OMPIC        → {len(signaux_ompic)} signaux")
-    except Exception as e:
-        logger.error(f"   OMPIC        → ERREUR : {e}")
+    sources = [
+        ("OMPIC",                     OmpicScraper),
+        ("Presse Économique",         PresseEcoScraper),
+        ("Bulletin Officiel",         BulletinOfficielScraper),
+        ("Conseil de la Concurrence", ConseilConcurrenceScraper),
+    ]
 
-    try:
-        presse = PresseEcoScraper()
-        signaux_presse = presse.run()
-        tous_signaux.extend(signaux_presse)
-        logger.info(f"   Presse éco   → {len(signaux_presse)} signaux")
-    except Exception as e:
-        logger.error(f"   Presse éco   → ERREUR : {e}")
+    for nom, ScraperClass in sources:
+        try:
+            scraper = ScraperClass()
+            signaux = scraper.run()
+            tous_signaux.extend(signaux)
+            logger.info(f"   {nom:<32} → {len(signaux)} signaux")
+        except Exception as e:
+            logger.error(f"   {nom:<32} → ERREUR : {e}")
 
     if not tous_signaux:
         logger.warning("⚠️ Aucun signal collecté")
         return
 
-    logger.info(f"\n   TOTAL        → {len(tous_signaux)} signaux bruts")
-
-    # ── DÉDUPLICATION ─────────────────────────────────────────────────────────
-    vus = set()
-    signaux_uniques = []
+    # Déduplication
+    vus, signaux_uniques = set(), []
     for s in tous_signaux:
         cle = (s.get("entreprise", "") or s.get("titre", "")[:50]).lower().strip()
         if cle and cle not in vus:
             vus.add(cle)
             signaux_uniques.append(s)
 
-    logger.info(f"   Après dédup  → {len(signaux_uniques)} signaux uniques")
+    logger.info(f"\n   TOTAL : {len(tous_signaux)} bruts → {len(signaux_uniques)} uniques")
 
-    # ── SCORING IA ────────────────────────────────────────────────────────────
+    # Scoring IA
     logger.info(f"\n🤖 PHASE 2 — Scoring IA\n")
     engine = ScoringEngine()
     signaux_scores = engine.analyser_batch(signaux_uniques)
 
-    # ── SAUVEGARDE SUPABASE ───────────────────────────────────────────────────
+    # Sauvegarde
     logger.info(f"\n💾 PHASE 3 — Sauvegarde Supabase\n")
-
-    critiques  = []
-    vigilances = []
+    critiques, vigilances, radar = [], [], []
 
     for signal in signaux_scores:
-        # Sauvegarder le signal brut
         sauvegarder_signal(supabase, signal)
-
-        # Sauvegarder comme opportunité si score suffisant
         niveau = signal.get("niveau_alerte", "FAIBLE")
-
         if niveau == "CRITIQUE":
-            # Générer mémo automatiquement
-            memo = engine.generer_memo(signal)
-            signal["memo_origination"] = memo
+            signal["memo_origination"] = engine.generer_memo(signal)
             sauvegarder_opportunite(supabase, signal)
             critiques.append(signal)
-
-        elif niveau == "VIGILANCE":
+        elif niveau in ("VIGILANCE", "RADAR"):
             sauvegarder_opportunite(supabase, signal)
-            vigilances.append(signal)
+            if niveau == "VIGILANCE":
+                vigilances.append(signal)
+            else:
+                radar.append(signal)
 
-        elif niveau == "RADAR":
-            sauvegarder_opportunite(supabase, signal)
-
-    # ── RAPPORT ───────────────────────────────────────────────────────────────
     duree = (datetime.now() - debut).seconds
     logger.info(f"""
 ╔══════════════════════════════════════════╗
-║      RAPPORT M&A RADAR MAROC            ║
-║      {debut.strftime('%d/%m/%Y — %H:%M')}                   ║
+║       RAPPORT M&A RADAR MAROC           ║
 ╠══════════════════════════════════════════╣
-║  🔴 CRITIQUES  : {len(critiques):>3}                      ║
-║  🟠 VIGILANCES : {len(vigilances):>3}                      ║
-║  ⏱️  Durée      : {duree}s                        ║
+║  🔴 CRITIQUES   : {len(critiques):>3}                     ║
+║  🟠 VIGILANCES  : {len(vigilances):>3}                     ║
+║  🟡 RADAR       : {len(radar):>3}                     ║
+║  ⏱️  Durée       : {duree}s                       ║
 ╚══════════════════════════════════════════╝
 """)
 
 
 if __name__ == "__main__":
-
     if "--schedule" in sys.argv:
-        logger.info(f"⏰ Mode planifié — Scan quotidien à {HEURE_SCAN_QUOTIDIEN}")
+        logger.info(f"⏰ Scan quotidien à {HEURE_SCAN_QUOTIDIEN}")
         schedule.every().day.at(HEURE_SCAN_QUOTIDIEN).do(run_pipeline)
-        run_pipeline()  # Premier scan immédiat
+        run_pipeline()
         while True:
             schedule.run_pending()
             time.sleep(60)
