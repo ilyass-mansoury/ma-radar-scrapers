@@ -10,7 +10,7 @@ from datetime import datetime
 from loguru import logger
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "COLLE-TA-CLÉ-ICI")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 # ─── FILTRE M&A STRICT ────────────────────────────────────────────────────
 # Mots-clés qui CONFIRMENT un signal M&A marocain
