@@ -1,74 +1,58 @@
 """
-M&A Radar Maroc — Scoring Engine (Gemini API)
-Gratuit : 1500 requêtes/jour, 15/minute
+M&A Radar Maroc — Scoring Engine (Gemini API - Batch Mode)
+Au lieu d'appeler Gemini 43 fois, on envoie tout en 1 seul appel.
+43 appels → 1 appel = quota quasi illimité.
 """
 
 import os
 import json
 import requests
-from datetime import datetime
 from loguru import logger
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "COLLE-TA-CLÉ-ICI")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-# ─── FILTRE M&A STRICT ────────────────────────────────────────────────────
-# Mots-clés qui CONFIRMENT un signal M&A marocain
+# ─── FILTRE RAPIDE (avant IA) ─────────────────────────────────────────────
 SIGNAL_FORT = [
     "fusion", "acquisition", "rachat", "cession", "apport",
     "augmentation de capital", "levée de fonds", "prise de participation",
     "transmission", "succession", "dissolution", "liquidation",
     "concentration", "offre publique", "introduction en bourse",
     "scission", "absorption", "restructuration", "désinvestissement",
+    "partenariat stratégique", "entrée au capital", "cède", "vend",
 ]
 
-# Mots-clés qui EXCLUENT un signal (bruit)
 BRUIT = [
     "football", "sport", "match", "joueur", "équipe", "tournoi",
     "champion", "goal", "ligue", "coupe", "mondial", "transfert sportif",
-    "météo", "culture", "musique", "cinéma", "people", "célébrité",
-    "politique", "élection", "parti", "ministre", "discours",
-    "recette", "cuisine", "voyage", "tourisme",
+    "météo", "musique", "cinéma", "people", "célébrité",
+    "élection", "parti", "discours", "recette", "cuisine", "voyage",
+    "retraite sportive", "retraite internationale",
 ]
 
-# Mots-clés contexte Maroc obligatoire
 CONTEXTE_MAROC = [
     "maroc", "marocain", "casablanca", "rabat", "tanger", "fès",
-    "agadir", "marrakech", "sa", "sarl", "sas", "mad", "dirham",
-    "ompic", "ammc", "bourse de casablanca", "bulletin officiel",
-    "conseil de la concurrence",
+    "agadir", "marrakech", "sa", "sarl", "mad", "dirham",
+    "ompic", "ammc", "bulletin officiel", "conseil de la concurrence",
 ]
 
 
-def filtrer_signal(texte: str) -> tuple[bool, str]:
-    """
-    Filtre strict avant d'envoyer à l'IA.
-    Retourne (pertinent: bool, raison: str)
-    """
+def filtrer_signal(texte: str) -> bool:
+    """Filtre rapide — élimine le bruit évident avant d'appeler l'IA."""
     if not texte or len(texte) < 20:
-        return False, "texte trop court"
-
-    texte_lower = texte.lower()
-
-    # Exclure le bruit évident
-    for mot in BRUIT:
-        if mot in texte_lower:
-            return False, f"bruit détecté: {mot}"
-
-    # Vérifier présence d'un signal M&A
-    has_signal = any(s in texte_lower for s in SIGNAL_FORT)
-
-    # Vérifier contexte marocain
-    has_maroc = any(m in texte_lower for m in CONTEXTE_MAROC)
-
-    if not has_signal and not has_maroc:
-        return False, "pas de signal M&A ni contexte marocain"
-
-    return True, "signal pertinent"
+        return False
+    t = texte.lower()
+    # Exclure bruit
+    if any(b in t for b in BRUIT):
+        return False
+    # Garder si signal M&A OU contexte marocain
+    has_signal = any(s in t for s in SIGNAL_FORT)
+    has_maroc  = any(m in t for m in CONTEXTE_MAROC)
+    return has_signal or has_maroc
 
 
-def appeler_gemini(prompt: str, max_tokens: int = 800) -> str:
-    """Appelle Gemini 1.5 Flash."""
+def appeler_gemini(prompt: str, max_tokens: int = 4000) -> str:
+    """Appelle Gemini 2.0 Flash."""
     try:
         response = requests.post(
             f"{GEMINI_URL}?key={GEMINI_KEY}",
@@ -77,19 +61,16 @@ def appeler_gemini(prompt: str, max_tokens: int = 800) -> str:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "maxOutputTokens": max_tokens,
-                    "temperature": 0.3,
+                    "temperature": 0.2,
                 }
             },
-            timeout=30
+            timeout=60
         )
-
         if response.status_code != 200:
-            logger.error(f"Gemini API error {response.status_code}: {response.text[:200]}")
+            logger.error(f"Gemini error {response.status_code}: {response.text[:300]}")
             return ""
-
         data = response.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
-
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         return ""
@@ -102,109 +83,138 @@ class ScoringEngine:
     SEUIL_RADAR     = 30
 
     def analyser_batch(self, signaux: list) -> list:
-        """Score un batch de signaux avec filtre strict + Gemini."""
-        resultats = []
-        filtres   = 0
-        scores    = 0
+        """
+        Score TOUS les signaux en UN SEUL appel Gemini.
+        43 signaux = 1 appel au lieu de 43.
+        """
+        if not signaux:
+            return []
 
-        logger.info(f"   🔍 Filtrage de {len(signaux)} signaux...")
+        # Étape 1 — Filtre rapide
+        filtres_avant = []
+        for s in signaux:
+            texte = f"{s.get('titre','')} {s.get('raw_text','')}"
+            if filtrer_signal(texte):
+                filtres_avant.append(s)
+            else:
+                logger.debug(f"   ⛔ Filtré: {texte[:60]}")
 
-        for signal in signaux:
-            texte = f"{signal.get('titre','')} {signal.get('raw_text','')}"
+        logger.info(f"   🔍 {len(signaux)} signaux → {len(filtres_avant)} après filtre rapide")
 
-            # Filtre rapide avant IA
-            pertinent, raison = filtrer_signal(texte)
-            if not pertinent:
-                logger.debug(f"   ⛔ Filtré — {raison}: {texte[:60]}")
-                filtres += 1
-                continue
+        if not filtres_avant:
+            logger.info("   ℹ️ Aucun signal pertinent après filtrage")
+            return []
 
-            # Score IA via Gemini
-            scored = self._scorer_signal(signal)
-            if scored.get("score_final", 0) >= self.SEUIL_RADAR:
-                resultats.append(scored)
-                scores += 1
+        # Étape 2 — Batch scoring en 1 seul appel Gemini
+        resultats = self._batch_score(filtres_avant)
 
-        logger.info(f"   📊 {filtres} signaux filtrés | {scores} opportunités retenues")
+        # Étape 3 — Stats
+        critiques  = sum(1 for r in resultats if r.get("niveau_alerte") == "CRITIQUE")
+        vigilances = sum(1 for r in resultats if r.get("niveau_alerte") == "VIGILANCE")
+        radar      = sum(1 for r in resultats if r.get("niveau_alerte") == "RADAR")
+        logger.info(f"   ✅ Scoring terminé — 🔴 {critiques} critiques | 🟠 {vigilances} vigilances | 🟡 {radar} radar")
+
         return resultats
 
-    def _scorer_signal(self, signal: dict) -> dict:
-        """Score un signal individuel avec Gemini."""
-        texte = f"{signal.get('titre', '')} {signal.get('raw_text', '')}"
+    def _batch_score(self, signaux: list) -> list:
+        """Envoie tous les signaux en un seul prompt Gemini."""
+
+        # Construire la liste numérotée pour Gemini
+        liste_signaux = ""
+        for i, s in enumerate(signaux):
+            texte = f"{s.get('titre', '')} {s.get('raw_text', '')}".strip()[:300]
+            liste_signaux += f"\n[{i}] Source:{s.get('source','N/A')} | {texte}"
 
         prompt = f"""Tu es un banquier M&A senior spécialisé sur le marché marocain (PME, family businesses).
 
-Analyse ce signal et retourne UNIQUEMENT un JSON valide, sans texte avant ou après :
+Analyse ces {len(signaux)} signaux et retourne UNIQUEMENT un tableau JSON valide.
+Pas de texte avant, pas de texte après, pas de backticks.
 
-Signal : {texte[:600]}
-Source : {signal.get('source', 'N/A')}
+SIGNAUX À ANALYSER:
+{liste_signaux}
 
-JSON attendu :
-{{
-  "pertinent_ma": true/false,
-  "score_final": 0-100,
-  "niveau_alerte": "CRITIQUE|VIGILANCE|RADAR|FAIBLE",
-  "type_deal_probable": "acquisition|cession|levee_fonds|pre_ipo|transmission|restructuring|inconnu",
-  "entreprise": "nom ou null",
-  "secteur": "secteur ou N/A",
-  "signaux_identifies": ["signal1", "signal2"],
-  "recommandation": "action concrète en 1 phrase"
-}}
+Retourne ce tableau JSON avec un objet par signal:
+[
+  {{
+    "index": 0,
+    "pertinent_ma": true,
+    "score_final": 75,
+    "niveau_alerte": "CRITIQUE",
+    "type_deal_probable": "acquisition",
+    "entreprise": "Nom SA",
+    "secteur": "Distribution",
+    "signaux_identifies": ["transmission_succession", "besoin_cash_bfr"],
+    "recommandation": "Contacter le fondateur cette semaine."
+  }},
+  ...
+]
 
-Règles scoring :
-- 80-100 : deal imminent, action urgente
-- 60-79  : signal fort, surveillance active
-- 40-59  : signal modéré, à surveiller
-- 0-39   : bruit, ignorer
+Règles de scoring:
+- 75-100 = CRITIQUE : deal imminent, action urgente
+- 50-74  = VIGILANCE : signal fort, surveiller
+- 30-49  = RADAR : signal modéré
+- 0-29   = FAIBLE : bruit, pas pertinent
 
-Si le signal n'est pas lié au M&A marocain, retourne pertinent_ma: false et score_final: 0."""
+Types de signaux: transmission_succession, acquereur_actif_secteur, desinvestissement_activite, besoin_cash_bfr, gearing_eleve, changement_direction, expansion_geographique, consolidation_sectorielle, investissements_recents, recrutement_profil_ma
 
-        reponse = appeler_gemini(prompt)
+Si un signal n'est pas lié au M&A marocain → pertinent_ma: false, score_final: 0, niveau_alerte: "FAIBLE"
+"""
+
+        reponse = appeler_gemini(prompt, max_tokens=4000)
 
         if not reponse:
-            return {**signal, "score_final": 0, "niveau_alerte": "FAIBLE"}
+            logger.warning("   ⚠️ Gemini n'a pas répondu — signaux non scorés")
+            return []
 
         try:
-            # Nettoyer le JSON (Gemini ajoute parfois des backticks)
+            # Nettoyer le JSON
             clean = reponse.strip()
             if "```" in clean:
-                clean = clean.split("```")[1]
-                if clean.startswith("json"):
-                    clean = clean[4:]
-            clean = clean.strip()
+                parts = clean.split("```")
+                for p in parts:
+                    if "[" in p and "{" in p:
+                        clean = p.replace("json", "").strip()
+                        break
 
-            result = json.loads(clean)
+            scores_ia = json.loads(clean)
 
-            # Si Gemini dit que c'est pas pertinent → score 0
-            if not result.get("pertinent_ma", True):
-                return {**signal, "score_final": 0, "niveau_alerte": "FAIBLE"}
+            # Fusionner avec les données originales
+            resultats = []
+            for score in scores_ia:
+                idx = score.get("index", -1)
+                if idx < 0 or idx >= len(signaux):
+                    continue
 
-            score = result.get("score_final", 0)
-            niveau = (
-                "CRITIQUE"  if score >= self.SEUIL_CRITIQUE  else
-                "VIGILANCE" if score >= self.SEUIL_VIGILANCE else
-                "RADAR"     if score >= self.SEUIL_RADAR     else
-                "FAIBLE"
-            )
+                if not score.get("pertinent_ma", True):
+                    continue
 
-            return {
-                **signal,
-                "score_final":        score,
-                "score_ia":           score,
-                "niveau_alerte":      niveau,
-                "type_deal_probable": result.get("type_deal_probable", "inconnu"),
-                "entreprise":         result.get("entreprise") or signal.get("entreprise"),
-                "secteur":            result.get("secteur", signal.get("secteur", "N/A")),
-                "signaux_identifies": result.get("signaux_identifies", []),
-                "recommandation":     result.get("recommandation", ""),
-            }
+                niveau = score.get("niveau_alerte", "FAIBLE")
+                if niveau == "FAIBLE" or score.get("score_final", 0) < self.SEUIL_RADAR:
+                    continue
+
+                signal_original = signaux[idx]
+                resultats.append({
+                    **signal_original,
+                    "score_final":        score.get("score_final", 0),
+                    "score_ia":           score.get("score_final", 0),
+                    "niveau_alerte":      niveau,
+                    "type_deal_probable": score.get("type_deal_probable", "inconnu"),
+                    "entreprise":         score.get("entreprise") or signal_original.get("entreprise"),
+                    "secteur":            score.get("secteur", signal_original.get("secteur", "N/A")),
+                    "signaux_identifies": score.get("signaux_identifies", []),
+                    "recommandation":     score.get("recommandation", ""),
+                })
+
+            logger.info(f"   📊 {len(resultats)}/{len(signaux)} signaux retenus après scoring IA")
+            return resultats
 
         except json.JSONDecodeError as e:
-            logger.warning(f"   ⚠️ JSON invalide de Gemini: {e} — {reponse[:100]}")
-            return {**signal, "score_final": 0, "niveau_alerte": "FAIBLE"}
+            logger.error(f"   ❌ JSON invalide de Gemini: {e}")
+            logger.debug(f"   Réponse brute: {reponse[:300]}")
+            return []
 
     def generer_memo(self, signal: dict) -> str:
-        """Génère un mémo d'origination complet avec Gemini."""
+        """Génère un mémo d'origination — 1 seul appel Gemini."""
         prompt = f"""Tu es un banquier M&A senior. Rédige un mémo d'origination professionnel et concis.
 
 Entreprise : {signal.get('entreprise', 'N/A')}
@@ -214,13 +224,13 @@ Signaux    : {', '.join(signal.get('signaux_identifies', []))}
 Source     : {signal.get('source', 'N/A')}
 Info brute : {signal.get('raw_text', '')[:400]}
 
-Structure du mémo (max 250 mots) :
+Structure (max 200 mots):
 1. SITUATION — contexte de l'entreprise
-2. SIGNAL — ce qui a été détecté
-3. THÈSE D'OPÉRATION — type de deal probable et logique
+2. SIGNAL DÉTECTÉ — ce qui a été observé
+3. THÈSE D'OPÉRATION — type de deal probable et logique stratégique
 4. PROCHAINE ÉTAPE — action concrète cette semaine
 
-Ton professionnel, direct, actionnable."""
+Ton: professionnel, direct, actionnable."""
 
-        memo = appeler_gemini(prompt, max_tokens=500)
-        return memo or f"Mémo non disponible — Signal détecté via {signal.get('source','N/A')}"
+        memo = appeler_gemini(prompt, max_tokens=600)
+        return memo or f"Mémo non disponible — Signal via {signal.get('source','N/A')}"
