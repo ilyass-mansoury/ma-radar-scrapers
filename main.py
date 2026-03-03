@@ -95,7 +95,7 @@ def run_pipeline():
 
 if __name__ == "__main__":
     if "--schedule" in sys.argv:
-        schedule.every().day.at(HEURE_SCAN_QUOTIDIEN).do(run_pipeline)
+        schedule.every(1).hours.do(run_pipeline)
         run_pipeline()
         while True:
             schedule.run_pending(); time.sleep(60)
